@@ -14,10 +14,10 @@
 //! technology frames and names, which is the same on both, and leaves the
 //! connection to the transport that carries it.
 
+use contract::ContractId;
 use logic::{
     Arrival, Fault, Header, Invocation, Logic, LogicError, OperationName, Outcome, Reply, Request,
 };
-use sdk::contract::ContractId;
 use stream::Stream;
 
 const CONTENT_TYPE: &str = "application/grpc";
