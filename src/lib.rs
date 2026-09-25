@@ -6,13 +6,17 @@
 //! length-prefixed message — one byte compressed flag, four bytes big-endian
 //! length, the protobuf bytes — and that message is the arguments. A result
 //! goes back as one frame with `grpc-status: 0` in the trailers; a fault as a
-//! non-zero `grpc-status` and a `grpc-message`. Metadata travels as headers
-//! both ways. Unary calls only: a stream of messages is a stream of
-//! invocations, and that is the transport's to deliver one at a time.
+//! non-zero `grpc-status` and a `grpc-message`, in the trailers too.
+//! Metadata travels as headers both ways. Unary calls only: a stream of
+//! messages is a stream of invocations, and that is the transport's to
+//! deliver one at a time.
 //!
-//! gRPC rides HTTP/2, and the `http` transport speaks HTTP/1.1 today; this
-//! technology frames and names, which is the same on both, and leaves the
-//! connection to the transport that carries it.
+//! gRPC rides HTTP/2, which `net::http2` speaks and the `http` transport
+//! agrees per connection (ADR-0043, amended 2026-09-25): the message on a
+//! stream of its own, `content-type: application/grpc`, the status in the
+//! trailing header block. This technology frames and names; the
+//! connection stays the transport's, and the tests call a method across a
+//! loopback HTTP/2 connection to show the two fit.
 
 use contract::ContractId;
 use logic::{
@@ -140,26 +144,24 @@ impl Logic for Grpc {
 
     fn reply(&self, invocation: &Invocation, outcome: &Outcome) -> Result<Reply, LogicError> {
         let id = invocation.arguments.id();
-        let mut headers = vec![
+        let headers = vec![
             Header::new(":status", "200"),
             Header::new("content-type", CONTENT_TYPE),
         ];
         Ok(match outcome {
-            Outcome::Result(result) => {
-                headers.push(Header::new("grpc-status", "0"));
-                Reply {
-                    headers,
-                    body: Stream::new(id, frame(result.bytes())?, Some(CONTENT_TYPE.to_string())),
-                }
-            }
-            Outcome::Fault(fault) => {
-                headers.push(Header::new("grpc-status", status_code(fault)));
-                headers.push(Header::new("grpc-message", fault.message.clone()));
-                Reply {
-                    headers,
-                    body: Stream::new(id, Vec::new(), Some(CONTENT_TYPE.to_string())),
-                }
-            }
+            Outcome::Result(result) => Reply {
+                headers,
+                body: Stream::new(id, frame(result.bytes())?, Some(CONTENT_TYPE.to_string())),
+                trailers: vec![Header::new("grpc-status", "0")],
+            },
+            Outcome::Fault(fault) => Reply {
+                headers,
+                body: Stream::new(id, Vec::new(), Some(CONTENT_TYPE.to_string())),
+                trailers: vec![
+                    Header::new("grpc-status", status_code(fault)),
+                    Header::new("grpc-message", fault.message.clone()),
+                ],
+            },
         })
     }
 
@@ -185,20 +187,21 @@ impl Logic for Grpc {
     }
 
     fn outcome(&self, invocation: &Invocation, reply: &Reply) -> Result<Outcome, LogicError> {
-        let status = reply
-            .headers
-            .iter()
-            .find(|h| h.name.eq_ignore_ascii_case("grpc-status"))
-            .map_or("0", |h| h.value.as_str());
-        if status != "0" {
-            let message = reply
-                .headers
+        // The trailers first; a reply with no body may carry its status in
+        // its only header block, which gRPC calls Trailers-Only.
+        let field = |name: &str| {
+            reply
+                .trailers
                 .iter()
-                .find(|h| h.name.eq_ignore_ascii_case("grpc-message"))
-                .map_or_else(String::new, |h| h.value.clone());
+                .chain(&reply.headers)
+                .find(|h| h.name.eq_ignore_ascii_case(name))
+                .map(|h| h.value.as_str())
+        };
+        let status = field("grpc-status").unwrap_or("0");
+        if status != "0" {
             return Ok(Outcome::Fault(Fault {
                 code: status.to_string(),
-                message,
+                message: field("grpc-message").unwrap_or_default().to_string(),
             }));
         }
         let (message, _) = unframe(reply.body.bytes())?;
@@ -221,6 +224,122 @@ mod tests {
             bytes.to_vec(),
             Some(CONTENT_TYPE.to_string()),
         )
+    }
+
+    fn headers(fields: &[(String, String)]) -> Vec<Header> {
+        fields
+            .iter()
+            .map(|(name, value)| Header::new(name.clone(), value.clone()))
+            .collect()
+    }
+
+    /// The Receive side, as a transport plays it: the request off an
+    /// HTTP/2 stream as an arrival, `GetOrder` answered with its argument
+    /// reversed and every other method unimplemented, and the reply as
+    /// the answer on the same stream.
+    fn served(request: &net::http::Request) -> net::http::Response {
+        assert_eq!(request.header_value("content-type"), Some(CONTENT_TYPE));
+        assert_eq!(request.header_value("te"), Some("trailers"));
+        let fields = headers(&request.headers);
+        let body = stream(&request.body);
+        let arrival = Arrival {
+            target: &request.path,
+            method: &request.method,
+            headers: &fields,
+            body: &body,
+        };
+        let invocation = Grpc.invocation(&arrival).expect("an invocation");
+        let outcome = if invocation.operation.name == "GetOrder" {
+            let mut bytes = invocation.arguments.bytes().to_vec();
+            bytes.reverse();
+            Outcome::Result(stream(&bytes))
+        } else {
+            Outcome::Fault(Fault {
+                code: "UNIMPLEMENTED".into(),
+                message: "no such method".into(),
+            })
+        };
+        let reply = Grpc.reply(&invocation, &outcome).expect("a reply");
+        let status = reply
+            .headers
+            .iter()
+            .find(|h| h.name == ":status")
+            .map_or(200, |h| h.value.parse().expect("a status"));
+        let mut answer = net::http::Response::new(status).body(reply.body.bytes());
+        for header in reply.headers.iter().filter(|h| !h.name.starts_with(':')) {
+            answer = answer.header(&header.name, &header.value);
+        }
+        for trailer in &reply.trailers {
+            answer = answer.trailer(&trailer.name, &trailer.value);
+        }
+        answer
+    }
+
+    /// The Send side: `method` invoked, its request sent on a stream of
+    /// the connection, and the answer read back as its outcome.
+    fn call(
+        client: &mut net::http2::Client<std::net::TcpStream>,
+        authority: &str,
+        method: &str,
+    ) -> (net::http::Response, Outcome) {
+        let invocation = Invocation {
+            operation: OperationName::new("orders.OrderService", method),
+            arguments: stream(b"\x08\x2a"),
+            parameters: vec![Header::new("x-request-id", "7")],
+            contract: None,
+        };
+        let request = Grpc.request(&invocation).expect("a request");
+        let mut sent = net::http::Request::new(&request.method, request.target.clone())
+            .header("Host", authority)
+            .body(request.body.bytes());
+        for header in &request.headers {
+            sent = sent.header(&header.name, &header.value);
+        }
+        let answer = client.send(&sent).expect("answered");
+        let reply = Reply {
+            headers: headers(&answer.headers),
+            body: stream(&answer.body),
+            trailers: headers(&answer.trailers),
+        };
+        let outcome = Grpc.outcome(&invocation, &reply).expect("an outcome");
+        (answer, outcome)
+    }
+
+    #[test]
+    fn a_method_is_called_across_a_loopback_http_2_connection() {
+        let wait = Some(std::time::Duration::from_secs(10));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let authority = listener.local_addr().expect("address").to_string();
+        let far = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().expect("accept");
+            socket.set_read_timeout(wait).expect("timeout");
+            net::http2::serve(socket, served).expect("served")
+        });
+        let socket = std::net::TcpStream::connect(&authority).expect("connect");
+        socket.set_read_timeout(wait).expect("timeout");
+        let mut client = net::http2::Client::handshake(socket, "http").expect("handshake");
+
+        let (answer, outcome) = call(&mut client, &authority, "GetOrder");
+        assert_eq!(answer.header_value("content-type"), Some(CONTENT_TYPE));
+        assert_eq!(answer.trailer_value("grpc-status"), Some("0"));
+        assert_eq!(answer.header_value("grpc-status"), None);
+        assert_eq!(answer.body, [0, 0, 0, 0, 2, 0x2a, 0x08]);
+        match outcome {
+            Outcome::Result(result) => assert_eq!(result.bytes(), b"\x2a\x08"),
+            Outcome::Fault(fault) => panic!("unexpected {fault:?}"),
+        }
+
+        let (answer, outcome) = call(&mut client, &authority, "CancelOrder");
+        assert_eq!(answer.trailer_value("grpc-status"), Some("12"));
+        match outcome {
+            Outcome::Fault(fault) => assert_eq!(
+                (fault.code.as_str(), fault.message.as_str()),
+                ("12", "no such method")
+            ),
+            Outcome::Result(_) => panic!("expected UNIMPLEMENTED"),
+        }
+        client.close();
+        assert_eq!(far.join().expect("thread"), 2);
     }
 
     #[test]
@@ -274,7 +393,8 @@ mod tests {
         let ok = Grpc
             .reply(&invocation, &Outcome::Result(stream(b"\x10\x2a")))
             .expect("reply");
-        assert!(ok.headers.contains(&Header::new("grpc-status", "0")));
+        assert_eq!(ok.trailers, [Header::new("grpc-status", "0")]);
+        assert!(!ok.headers.iter().any(|h| h.name.starts_with("grpc-")));
         assert_eq!(ok.body.bytes(), b"\x00\x00\x00\x00\x02\x10\x2a");
         let fault = Fault {
             code: "NOT_FOUND".into(),
@@ -283,7 +403,7 @@ mod tests {
         let refused = Grpc
             .reply(&invocation, &Outcome::Fault(fault))
             .expect("reply");
-        assert!(refused.headers.contains(&Header::new("grpc-status", "5")));
+        assert!(refused.trailers.contains(&Header::new("grpc-status", "5")));
         assert!(refused.body.is_empty());
     }
 
@@ -304,14 +424,17 @@ mod tests {
         );
         assert_eq!(request.body.bytes()[..5], [0, 0, 0, 0, 2]);
         let answered = Reply {
-            headers: vec![Header::new("grpc-status", "0")],
+            trailers: vec![Header::new("grpc-status", "0")],
+            headers: vec![Header::new(":status", "200")],
             body: stream(&frame(b"\x10\x01").expect("frame")),
         };
         match Grpc.outcome(&invocation, &answered).expect("outcome") {
             Outcome::Result(result) => assert_eq!(result.bytes(), b"\x10\x01"),
             Outcome::Fault(fault) => panic!("unexpected {fault:?}"),
         }
+        // Trailers-Only: no body, the status in the one header block.
         let refused = Reply {
+            trailers: Vec::new(),
             headers: vec![
                 Header::new("grpc-status", "5"),
                 Header::new("grpc-message", "no such order"),
