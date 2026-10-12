@@ -22,41 +22,23 @@ use contract::ContractId;
 use logic::{
     Arrival, Fault, Header, Invocation, Logic, LogicError, OperationName, Outcome, Reply, Request,
 };
+use net::grpc;
 use stream::Stream;
 
-const CONTENT_TYPE: &str = "application/grpc";
+const CONTENT_TYPE: &str = grpc::CONTENT_TYPE;
 const ARGUMENTS: &str = "application/protobuf";
 
 /// The gRPC technology.
 pub struct Grpc;
 
 /// The first message in a length-prefixed body, and whether it was flagged
-/// compressed.
+/// compressed: `net::grpc`'s, the one framing in the estate.
 fn unframe(body: &[u8]) -> Result<(&[u8], bool), LogicError> {
-    if body.len() < 5 {
-        return Err(LogicError::new(
-            "the body is shorter than a gRPC frame prefix",
-        ));
-    }
-    let compressed = body[0] != 0;
-    let length = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
-    body.get(5..5 + length)
-        .map(|message| (message, compressed))
-        .ok_or_else(|| {
-            LogicError::new(format!(
-                "the frame claims {length} bytes, the body has fewer"
-            ))
-        })
+    grpc::unframe(body).map_err(|failed| LogicError::new(failed.message))
 }
 
 fn frame(message: &[u8]) -> Result<Vec<u8>, LogicError> {
-    let length = u32::try_from(message.len())
-        .map_err(|_| LogicError::new("a message over 4 GiB does not fit a frame"))?;
-    let mut out = Vec::with_capacity(5 + message.len());
-    out.push(0);
-    out.extend_from_slice(&length.to_be_bytes());
-    out.extend_from_slice(message);
-    Ok(out)
+    grpc::frame(message).map_err(|failed| LogicError::new(failed.message))
 }
 
 /// `/package.Service/Method` into its two names.
@@ -93,27 +75,8 @@ fn metadata(headers: &[Header]) -> Vec<Header> {
         .collect()
 }
 
-fn status_code(fault: &Fault) -> &str {
-    match fault.code.as_str() {
-        "CANCELLED" => "1",
-        "UNKNOWN" => "2",
-        "INVALID_ARGUMENT" => "3",
-        "DEADLINE_EXCEEDED" => "4",
-        "NOT_FOUND" => "5",
-        "ALREADY_EXISTS" => "6",
-        "PERMISSION_DENIED" => "7",
-        "RESOURCE_EXHAUSTED" => "8",
-        "FAILED_PRECONDITION" => "9",
-        "ABORTED" => "10",
-        "OUT_OF_RANGE" => "11",
-        "UNIMPLEMENTED" => "12",
-        "INTERNAL" => "13",
-        "UNAVAILABLE" => "14",
-        "DATA_LOSS" => "15",
-        "UNAUTHENTICATED" => "16",
-        numeric if numeric.parse::<u8>().is_ok() => numeric,
-        _ => "2",
-    }
+fn status_code(fault: &Fault) -> String {
+    grpc::code(&fault.code).to_string()
 }
 
 impl Logic for Grpc {
@@ -158,7 +121,7 @@ impl Logic for Grpc {
                 headers,
                 body: Stream::new(id, Vec::new(), Some(CONTENT_TYPE.to_string())),
                 trailers: vec![
-                    Header::new("grpc-status", status_code(fault)),
+                    Header::new(grpc::STATUS, status_code(fault)),
                     Header::new("grpc-message", fault.message.clone()),
                 ],
             },
