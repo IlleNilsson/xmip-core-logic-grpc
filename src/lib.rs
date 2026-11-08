@@ -86,7 +86,7 @@ impl Logic for Grpc {
 
     fn invocation(&self, arrival: &Arrival<'_>) -> Result<Invocation, LogicError> {
         let operation = name_of(arrival.target)?;
-        let (message, compressed) = unframe(arrival.body.bytes())?;
+        let (message, compressed) = unframe(arrival.body.load()?)?;
         let mut parameters = metadata(arrival.headers);
         if compressed {
             // The bytes are passed through with the fact recorded; decoding is
@@ -114,7 +114,7 @@ impl Logic for Grpc {
         Ok(match outcome {
             Outcome::Result(result) => Reply {
                 headers,
-                body: Stream::new(id, frame(result.bytes())?, Some(CONTENT_TYPE.to_string())),
+                body: Stream::new(id, frame(result.load()?)?, Some(CONTENT_TYPE.to_string())),
                 trailers: vec![Header::new("grpc-status", "0")],
             },
             Outcome::Fault(fault) => Reply {
@@ -143,7 +143,7 @@ impl Logic for Grpc {
             headers,
             body: Stream::new(
                 invocation.arguments.id(),
-                frame(invocation.arguments.bytes())?,
+                frame(invocation.arguments.load()?)?,
                 Some(CONTENT_TYPE.to_string()),
             ),
         })
@@ -167,7 +167,7 @@ impl Logic for Grpc {
                 message: field("grpc-message").unwrap_or_default().to_string(),
             }));
         }
-        let (message, _) = unframe(reply.body.bytes())?;
+        let (message, _) = unframe(reply.body.load()?)?;
         Ok(Outcome::Result(Stream::new(
             invocation.arguments.id(),
             message.to_vec(),
@@ -213,7 +213,7 @@ mod tests {
         };
         let invocation = Grpc.invocation(&arrival).expect("an invocation");
         let outcome = if invocation.operation.name == "GetOrder" {
-            let mut bytes = invocation.arguments.bytes().to_vec();
+            let mut bytes = invocation.arguments.load().expect("held").to_vec();
             bytes.reverse();
             Outcome::Result(stream(&bytes))
         } else {
@@ -228,7 +228,7 @@ mod tests {
             .iter()
             .find(|h| h.name == ":status")
             .map_or(200, |h| h.value.parse().expect("a status"));
-        let mut answer = net::http::Response::new(status).body(reply.body.bytes());
+        let mut answer = net::http::Response::new(status).body(reply.body.load().expect("held"));
         for header in reply.headers.iter().filter(|h| !h.name.starts_with(':')) {
             answer = answer.header(&header.name, &header.value);
         }
@@ -254,7 +254,7 @@ mod tests {
         let request = Grpc.request(&invocation).expect("a request");
         let mut sent = net::http::Request::new(&request.method, request.target.clone())
             .header("Host", authority)
-            .body(request.body.bytes());
+            .body(request.body.load().expect("held"));
         for header in &request.headers {
             sent = sent.header(&header.name, &header.value);
         }
@@ -288,7 +288,7 @@ mod tests {
         assert_eq!(answer.header_value("grpc-status"), None);
         assert_eq!(answer.body, [0, 0, 0, 0, 2, 0x2a, 0x08]);
         match outcome {
-            Outcome::Result(result) => assert_eq!(result.bytes(), b"\x2a\x08"),
+            Outcome::Result(result) => assert_eq!(result.load().expect("held"), b"\x2a\x08"),
             Outcome::Fault(fault) => panic!("unexpected {fault:?}"),
         }
 
@@ -323,7 +323,7 @@ mod tests {
             invocation.operation,
             OperationName::new("orders.OrderService", "PlaceOrder")
         );
-        assert_eq!(invocation.arguments.bytes(), b"\x0a\x01X");
+        assert_eq!(invocation.arguments.load().expect("held"), b"\x0a\x01X");
         assert_eq!(
             invocation.parameters,
             vec![Header::new("x-request-id", "7")]
@@ -358,7 +358,10 @@ mod tests {
             .expect("reply");
         assert_eq!(ok.trailers, [Header::new("grpc-status", "0")]);
         assert!(!ok.headers.iter().any(|h| h.name.starts_with("grpc-")));
-        assert_eq!(ok.body.bytes(), b"\x00\x00\x00\x00\x02\x10\x2a");
+        assert_eq!(
+            ok.body.load().expect("held"),
+            b"\x00\x00\x00\x00\x02\x10\x2a"
+        );
         let fault = Fault {
             code: "NOT_FOUND".into(),
             message: "no such order".into(),
@@ -385,14 +388,14 @@ mod tests {
                 .headers
                 .contains(&Header::new("authorization", "Bearer t"))
         );
-        assert_eq!(request.body.bytes()[..5], [0, 0, 0, 0, 2]);
+        assert_eq!(request.body.load().expect("held")[..5], [0, 0, 0, 0, 2]);
         let answered = Reply {
             trailers: vec![Header::new("grpc-status", "0")],
             headers: vec![Header::new(":status", "200")],
             body: stream(&frame(b"\x10\x01").expect("frame")),
         };
         match Grpc.outcome(&invocation, &answered).expect("outcome") {
-            Outcome::Result(result) => assert_eq!(result.bytes(), b"\x10\x01"),
+            Outcome::Result(result) => assert_eq!(result.load().expect("held"), b"\x10\x01"),
             Outcome::Fault(fault) => panic!("unexpected {fault:?}"),
         }
         // Trailers-Only: no body, the status in the one header block.
