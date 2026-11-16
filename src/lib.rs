@@ -276,11 +276,12 @@ mod tests {
         let far = std::thread::spawn(move || {
             let (socket, _) = listener.accept().expect("accept");
             socket.set_read_timeout(wait).expect("timeout");
-            net::http2::serve(socket, served).expect("served")
+            net::http2::serve(socket, Box::new(|| 0), served).expect("served")
         });
         let socket = std::net::TcpStream::connect(&authority).expect("connect");
         socket.set_read_timeout(wait).expect("timeout");
-        let mut client = net::http2::Client::handshake(socket, "http").expect("handshake");
+        let mut client =
+            net::http2::Client::handshake(socket, "http", Box::new(|| 0)).expect("handshake");
 
         let (answer, outcome) = call(&mut client, &authority, "GetOrder");
         assert_eq!(answer.header_value("content-type"), Some(CONTENT_TYPE));
