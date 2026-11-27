@@ -19,11 +19,6 @@ HTTP/2 itself is `net::http2` in
 and the connection stays the transport's; the tests call a method across a
 loopback HTTP/2 connection to show the two fit.
 
-## Toolchain
-
-`rust-toolchain.toml` pins the toolchain for the whole estate. Do not change it
-here.
-
 ## Verification
 
 The included workflow is manual-only and calls the versioned shared workflow at
